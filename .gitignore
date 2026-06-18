@@ -1,0 +1,6 @@
+*.class
+*.jar
+.diretorio_ide/
+bin/
+target/
+.DS_Store
