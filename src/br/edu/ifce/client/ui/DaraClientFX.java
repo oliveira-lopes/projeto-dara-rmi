@@ -1,6 +1,9 @@
 package br.edu.ifce.client.ui;
 
 import br.edu.ifce.shared.model.CellState;
+import br.edu.ifce.shared.model.DaraClientInterface;
+import br.edu.ifce.shared.model.DaraServerInterface;
+
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -10,19 +13,17 @@ import javafx.scene.control.*;
 import javafx.scene.layout.*;
 import javafx.stage.Stage;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.Socket;
+import java.rmi.Naming;
+import java.rmi.RemoteException;
+import java.rmi.server.UnicastRemoteObject;
 
-public class DaraClientFX extends Application {
-    private static final String SERVER_IP = "127.0.0.1";
-    private static final int SERVER_PORT = 12345;
+public class DaraClientFX extends Application implements DaraClientInterface {
+    
+    // Configurações do Registro RMI
+    private static final String RMI_URL = "rmi://127.0.0.1:1099/DaraServerService";
 
-    private Socket socket;
-    private PrintWriter out;
-    private BufferedReader in;
+    // Interfaces de Comunicação RMI (Substituem os Sockets)
+    private DaraServerInterface servidorRemoto;
 
     private CellState myColor = null;
     private CellState currentTurn = null;
@@ -40,7 +41,7 @@ public class DaraClientFX extends Application {
 
     @Override
     public void start(Stage primaryStage) {
-        primaryStage.setTitle("Dara Strategy Game Pro");
+        primaryStage.setTitle("Dara Strategy Game Pro (RMI Edition)");
 
         // --- PAINEL DO TABULEIRO ---
         GridPane boardGrid = new GridPane();
@@ -60,7 +61,7 @@ public class DaraClientFX extends Application {
         sidePanel.setPadding(new Insets(20));
         sidePanel.setStyle("-fx-background-color: #1a1a1e;");
 
-        statusLabel = new Label("A CONECTAR AO SERVIDOR...");
+        statusLabel = new Label("LOCALIZANDO SERVIÇO RMI...");
         statusLabel.setStyle("-fx-font-family: 'Segoe UI'; -fx-font-weight: bold; -fx-font-size: 14px; -fx-text-fill: white;");
         
         statusPanel = new HBox(statusLabel);
@@ -107,7 +108,7 @@ public class DaraClientFX extends Application {
         primaryStage.setResizable(false);
         primaryStage.show();
 
-        // EXECUÇÃO EM SEGUNDO PLANO: Evita travar a abertura da janela
+        // Conecta ao servidor RMI de forma assíncrona para não congelar o carregamento da janela
         new Thread(this::connectToServer).start();
     }
 
@@ -140,22 +141,36 @@ public class DaraClientFX extends Application {
 
     private void connectToServer() {
         try {
-            socket = new Socket(SERVER_IP, SERVER_PORT);
-            out = new PrintWriter(socket.getOutputStream(), true);
-            in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            // 1. Exporta esta instância JavaFX no subsistema RMI de forma dinâmica
+            UnicastRemoteObject.exportObject(this, 0);
+
+            // 2. Localiza o serviço remoto do Dara Server pelo contrato de nomes
+            servidorRemoto = (DaraServerInterface) Naming.lookup(RMI_URL);
             
-            Platform.runLater(() -> chatArea.appendText(" AGUARDANDO JOGADOR 2...\n"));
+            // 3. Cadastra o cliente e descobre dinamicamente a cor/papel associado (PLAYER_1 ou PLAYER_2)
+            String papel = servidorRemoto.registrarJogador(this);
+
+            if (papel.equals("CHEIO")) {
+                Platform.runLater(() -> {
+                    showErrorAlert("Partida Cheia", "A partida solicitada já conta com o limite de 2 jogadores ativos.");
+                    System.exit(0);
+                });
+                return;
+            }
+
+            myColor = CellState.valueOf(papel);
             
-            // Inicia a escuta de mensagens do servidor
-            new Thread(new ServerListener()).start();
-        } catch (IOException e) {
-            // Se falhar, exibe o alerta de erro de forma segura na Thread da UI
+            // Configura o título da janela de acordo com a cor recebida do RMI
             Platform.runLater(() -> {
-                Alert alert = new Alert(Alert.AlertType.ERROR);
-                alert.setTitle("Erro de Conexão");
-                alert.setHeaderText("Não foi possível conectar ao servidor");
-                alert.setContentText("Certifique-se de que o DaraServer está rodando no Terminal 1 (porta 12345).");
-                alert.showAndWait();
+                Stage stage = (Stage) chatArea.getScene().getWindow();
+                stage.setTitle("Dara Game RMI - " + (myColor == CellState.PLAYER_1 ? "Brancas (Jogador 1)" : "Pretas (Jogador 2)"));
+                chatArea.appendText(" Conectado ao Servidor RMI como " + myColor.name() + ".\n");
+                chatArea.appendText(" Aguardando segundo oponente iniciar...\n");
+            });
+
+        } catch (Exception e) {
+            Platform.runLater(() -> {
+                showErrorAlert("Erro de Comunicação RMI", "Não foi possível se associar ao serviço do DaraServerRMI.\nVerifique se o servidor está ativo no Registro (porta 1099).");
                 System.exit(0);
             });
         }
@@ -163,86 +178,87 @@ public class DaraClientFX extends Application {
 
     private void sendChatMessage() {
         String text = chatInput.getText().trim();
-        if (!text.isEmpty() && out != null) {
-            out.println("CHAT;" + text);
-            chatInput.setText("");
+        if (!text.isEmpty() && servidorRemoto != null) {
+            try {
+                // Invocação remota direta substituindo o fluxo manual por strings concatenadas
+                servidorRemoto.enviarMensagemChat(myColor.name(), text);
+                chatInput.setText("");
+            } catch (RemoteException e) {
+                chatArea.appendText("❌ Falha de rede ao tentar enviar mensagem.\n");
+            }
         }
     }
 
     private void handleBoardClick(int row, int col) {
-        if (myColor == null || currentTurn != myColor) return;
+        if (myColor == null || currentTurn != myColor || servidorRemoto == null) return;
 
-        if (currentPhase.equals("PLACE")) {
-            out.println("PUT;" + row + ";" + col);
-        } else if (currentPhase.equals("MOVE")) {
-            if (selectedRow == -1) {
-                selectedRow = row;
-                selectedCol = col;
-                boardButtons[row][col].setStyle(boardButtons[row][col].getStyle() + " -fx-border-color: #ffcc00; -fx-border-radius: 12; -fx-border-width: 3;");
-            } else {
-                out.println("MOVE;" + selectedRow + ";" + selectedCol + ";" + row + ";" + col);
-                selectedRow = -1;
-                selectedCol = -1;
+        try {
+            if (currentPhase.equals("PLACE")) {
+                servidorRemoto.processarColocacao(myColor.name(), row, col);
+            } else if (currentPhase.equals("MOVE")) {
+                if (selectedRow == -1) {
+                    selectedRow = row;
+                    selectedCol = col;
+                    boardButtons[row][col].setStyle(boardButtons[row][col].getStyle() + " -fx-border-color: #ffcc00; -fx-border-radius: 12; -fx-border-width: 3;");
+                } else {
+                    servidorRemoto.processarMovimento(myColor.name(), selectedRow, selectedCol, row, col);
+                    selectedRow = -1;
+                    selectedCol = -1;
+                }
+            } else if (currentPhase.equals("CAPTURE")) {
+                servidorRemoto.processarCaptura(myColor.name(), row, col);
             }
-        } else if (currentPhase.equals("CAPTURE")) {
-            out.println("CAPTURE;" + row + ";" + col);
+        } catch (RemoteException e) {
+            chatArea.appendText("❌ Erro ao sincronizar ação no tabuleiro remoto.\n");
         }
     }
 
     private void handleDesistencia() {
-        if (out != null) out.println("DESISTENCIA");
-    }
-
-    private class ServerListener implements Runnable {
-        @Override
-        public void run() {
+        if (servidorRemoto != null && myColor != null) {
             try {
-                String line;
-                while ((line = in.readLine()) != null) {
-                    String[] tokens = line.split(";");
-                    String command = tokens[0];
-
-                    switch (command) {
-                        case "START":
-                            myColor = CellState.valueOf(tokens[1]);
-                            Platform.runLater(() -> {
-                                Stage stage = (Stage) chatArea.getScene().getWindow();
-                                stage.setTitle("Dara Game - " + (myColor == CellState.PLAYER_1 ? "Brancas (Jogador 1)" : "Pretas (Jogador 2)"));
-                            });
-                            break;
-
-                        case "CHAT":
-                            String msg = tokens[1];
-                            Platform.runLater(() -> chatArea.appendText(" " + msg + "\n"));
-                            break;
-
-                        case "UPDATE":
-                            String boardData = tokens[1];
-                            currentTurn = CellState.valueOf(tokens[2]);
-                            currentPhase = tokens[3];
-                            Platform.runLater(() -> updateBoardUI(boardData));
-                            break;
-
-                        case "WINNER":
-                            String winner = tokens[1];
-                            Platform.runLater(() -> {
-                                statusLabel.setText("PARTIDA CONCLUÍDA");
-                                statusPanel.setStyle("-fx-background-color: #4b6eaf; -fx-background-radius: 10;");
-                                Alert alert = new Alert(Alert.AlertType.INFORMATION);
-                                alert.setTitle("Fim de Jogo");
-                                alert.setHeaderText(null);
-                                alert.setContentText("🎉 VITÓRIA DO JOGADOR: " + winner);
-                                alert.showAndWait();
-                                System.exit(0);
-                            });
-                            break;
-                    }
-                }
-            } catch (IOException e) {
-                Platform.runLater(() -> chatArea.appendText("❌ Conexão perdida.\n"));
+                servidorRemoto.processarDesistencia(myColor.name());
+            } catch (RemoteException e) {
+                chatArea.appendText("❌ Erro de conexão ao notificar desistência.\n");
             }
         }
     }
+
+    // =========================================================================
+    // IMPLEMENTAÇÃO DAS OPERAÇÕES DO CONTRATO RMI (CALLBACKS DO SERVIDOR)
+    // =========================================================================
+
+    @Override
+    public void receberAtualizacaoEstado(String tabuleiroSerializado, String turnoAtual, String faseAtual) throws RemoteException {
+        this.currentTurn = CellState.valueOf(turnoAtual);
+        this.currentPhase = faseAtual;
+        
+        // Garante que a atualização gráfica rode sincronizada com o JavaFX Application Thread
+        Platform.runLater(() -> updateBoardUI(tabuleiroSerializado));
+    }
+
+    @Override
+    public void receberMensagemChat(String remetente, String texto) throws RemoteException {
+        Platform.runLater(() -> chatArea.appendText(" " + remetente + ": " + texto + "\n"));
+    }
+
+    @Override
+    public void notificarVencedor(String vencedor) throws RemoteException {
+        Platform.runLater(() -> {
+            statusLabel.setText("PARTIDA CONCLUÍDA");
+            statusPanel.setStyle("-fx-background-color: #4b6eaf; -fx-background-radius: 10;");
+            
+            Alert alert = new Alert(Alert.AlertType.INFORMATION);
+            alert.setTitle("Fim de Jogo");
+            alert.setHeaderText(null);
+            alert.setContentText("🎉 VITÓRIA DO JOGADOR: " + vencedor);
+            alert.showAndWait();
+            System.exit(0);
+        });
+    }
+
+    // =========================================================================
+    // MÉTODOS AUXILIARES DE RENDERIZAÇÃO
+    // =========================================================================
 
     private void updateBoardUI(String boardData) {
         String[] cells = boardData.split(",");
@@ -256,13 +272,13 @@ public class DaraClientFX extends Application {
 
                 if (state == CellState.PLAYER_1) {
                     btn.setText("⚪");
-                    btn.setStyle("-fx-background-color: #e1e1e6; -fx-background-radius: 12; -fx-text-fill: #121214;");
+                    btn.setStyle("-fx-background-color: #e1e1e6; -fx-background-radius: 12; -fx-text-fill: #121214; -fx-font-size: 36px;");
                 } else if (state == CellState.PLAYER_2) {
                     btn.setText("⚫");
-                    btn.setStyle("-fx-background-color: #121214; -fx-background-radius: 12; -fx-text-fill: #e1e1e6; -fx-border-color: #2d2d35; -fx-border-radius: 12;");
+                    btn.setStyle("-fx-background-color: #121214; -fx-background-radius: 12; -fx-text-fill: #e1e1e6; -fx-border-color: #2d2d35; -fx-border-radius: 12; -fx-font-size: 36px;");
                 } else {
                     btn.setText("");
-                    btn.setStyle("-fx-background-color: #2a2c32; -fx-background-radius: 12;");
+                    btn.setStyle("-fx-background-color: #2a2c32; -fx-background-radius: 12; -fx-font-size: 36px;");
                 }
             }
         }
@@ -274,6 +290,14 @@ public class DaraClientFX extends Application {
             statusLabel.setText("A GUARDAR OPONENTE...");
             statusPanel.setStyle("-fx-background-color: #8c5a28; -fx-background-radius: 10;");
         }
+    }
+
+    private void showErrorAlert(String titulo, String mensagem) {
+        Alert alert = new Alert(Alert.AlertType.ERROR);
+        alert.setTitle(titulo);
+        alert.setHeaderText(null);
+        alert.setContentText(mensagem);
+        alert.showAndWait();
     }
 
     public static void main(String[] args) {
